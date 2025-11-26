@@ -9,7 +9,13 @@ moBRCA-net is an omics-level attention-based breast cancer subtype classificatio
 * numpy >= 1.26, pandas, scikit-learn (for data prep)
 
 ## Usage
-Clone the repository or download source code files and prepare breast cancer multi-omics dataset including gene expression, DNA methylation, and microRNA expression.
+Clone the repository or download source code files and prepare breast cancer multi-omics dataset including gene expression, DNA methylation, and microRNA expression.  
+Data used here comes from the TCGA BRCA “top” feature sets in the Cancer-Multi-Omics-Benchmark project: https://github.com/chenzRG/Cancer-Multi-Omics-Benchmark (see BRCA_mRNA_top.csv, BRCA_Methy_top.csv, BRCA_miRNA_top.csv, BRCA_CNV_top.csv).
+
+## Notes on origin and changes
+- This codebase is a fork/translation of the original moBRCA-net (https://github.com/cbi-bioinfo/moBRCA-net); core idea and architecture belong to the original authors.  
+- Changes here: reimplemented model in PyTorch, added `prepare_data.py` for data merging/normalization, added configuration via environment variables, and defaulted to the “top” TCGA BRCA feature sets from Cancer-Multi-Omics-Benchmark for experiments.  
+- License remains the original LICENSE from the upstream project.
 
 ### Quick start (data prep + train)
 1) Chuẩn bị dữ liệu thô:  

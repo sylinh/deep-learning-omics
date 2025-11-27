@@ -1,4 +1,4 @@
-num_gene=500
-num_cpg=500
-num_mirna=100
+num_gene=3000
+num_cpg=3000
+num_mirna=200
 classes=[0, 1, 2, 3, 4]

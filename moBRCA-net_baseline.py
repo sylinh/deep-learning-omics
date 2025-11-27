@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 
 
 class MultiOmicsDataset(Dataset):
@@ -86,35 +86,11 @@ class OmicsAttention(nn.Module):
         return new_rep, attn
 
 
-class GraphEncoder(nn.Module):
-    """2-layer GCN encoder trên đồ thị tương đồng mẫu."""
-    def __init__(self, in_dim, hidden_dim=128, out_dim=64, dropout=0.2):
-        super().__init__()
-        self.w1 = nn.Linear(in_dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, out_dim, bias=False)
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, adj_norm):
-        """
-        x: (B, in_dim)
-        adj_norm: (B, B) normalized adjacency with self-loops
-        """
-        h = adj_norm @ x
-        h = self.w1(h)
-        h = self.relu(h)
-        h = self.dropout(h)
-        h = adj_norm @ h
-        h = self.w2(h)
-        return h
-
-
 class MoBRCANetTorch(nn.Module):
     """
-    Phiên bản PyTorch mở rộng:
-    - Attention feature-level cho 3 omics
-    - Nhánh GCN trên đồ thị mẫu (tùy chọn)
-    - Ghép rep -> FC -> Softmax
+    Phiên bản PyTorch bám sát moBRCA-net gốc:
+    - Attention cho gene, methyl, mirna
+    - Nối 3 rep -> FC -> Softmax
     """
     def __init__(self,
                  n_gene,
@@ -124,43 +100,23 @@ class MoBRCANetTorch(nn.Module):
                  n_embedding=128,
                  n_proj=64,
                  n_sm_h2=200,
-                 dropout=0.2,
-                 use_graph=True,
-                 g_hidden=128,
-                 g_out=64):
+                 dropout=0.2):
         super().__init__()
-        self.use_graph = use_graph
         self.gene_attn = OmicsAttention(n_gene, n_embedding, n_proj, dropout)
         self.methyl_attn = OmicsAttention(n_methyl, n_embedding, n_proj, dropout)
         self.mirna_attn = OmicsAttention(n_mirna, n_embedding, n_proj, dropout)
 
-        branch_out = n_proj
-        if use_graph:
-            self.gene_gnn = GraphEncoder(n_gene, g_hidden, g_out, dropout)
-            self.methyl_gnn = GraphEncoder(n_methyl, g_hidden, g_out, dropout)
-            self.mirna_gnn = GraphEncoder(n_mirna, g_hidden, g_out, dropout)
-            branch_out = n_proj + g_out
-
-        in_dim = 3 * branch_out
+        in_dim = 3 * n_proj
         self.fc2 = nn.Linear(in_dim, n_sm_h2)
         self.bn2 = nn.BatchNorm1d(n_sm_h2)
         self.elu = nn.ELU()
         self.dropout = nn.Dropout(dropout)
         self.fc_out = nn.Linear(n_sm_h2, n_classes)
 
-    def forward(self, gene_x, methyl_x, mirna_x,
-                adj_gene=None, adj_methyl=None, adj_mirna=None):
+    def forward(self, gene_x, methyl_x, mirna_x):
         rep_gene, attn_gene = self.gene_attn(gene_x)
         rep_methyl, attn_methyl = self.methyl_attn(methyl_x)
         rep_mirna, attn_mirna = self.mirna_attn(mirna_x)
-
-        if self.use_graph:
-            g_gene = self.gene_gnn(gene_x, adj_gene)
-            g_methyl = self.methyl_gnn(methyl_x, adj_methyl)
-            g_mirna = self.mirna_gnn(mirna_x, adj_mirna)
-            rep_gene = torch.cat([rep_gene, g_gene], dim=1)
-            rep_methyl = torch.cat([rep_methyl, g_methyl], dim=1)
-            rep_mirna = torch.cat([rep_mirna, g_mirna], dim=1)
 
         rep_concat = torch.cat([rep_gene, rep_methyl, rep_mirna], dim=1)
         h = self.fc2(rep_concat)
@@ -169,30 +125,7 @@ class MoBRCANetTorch(nn.Module):
         h = self.dropout(h)
         logits = self.fc_out(h)
 
-        return logits, (attn_gene, attn_methyl, attn_mirna), (rep_gene, rep_methyl, rep_mirna)
-
-
-def build_knn_adj(x_np, k=10):
-    """
-    x_np: numpy array (N, F)
-    return normalized adjacency (torch.FloatTensor, N x N)
-    """
-    N = x_np.shape[0]
-    x_norm = x_np / (np.linalg.norm(x_np, axis=1, keepdims=True) + 1e-8)
-    sim = x_norm @ x_norm.T  # (N, N)
-    np.fill_diagonal(sim, -np.inf)
-    k_eff = min(k, N - 1)
-    idx = np.argpartition(-sim, kth=k_eff, axis=1)[:, :k_eff]
-    rows = np.repeat(np.arange(N), k_eff)
-    cols = idx.reshape(-1)
-    adj = np.zeros((N, N), dtype=np.float32)
-    adj[rows, cols] = 1.0
-    adj = np.maximum(adj, adj.T)
-    np.fill_diagonal(adj, 1.0)
-    deg = adj.sum(axis=1)
-    deg_inv_sqrt = 1.0 / np.sqrt(deg + 1e-8)
-    adj_norm = adj * deg_inv_sqrt[:, None] * deg_inv_sqrt[None, :]
-    return torch.tensor(adj_norm, dtype=torch.float32)
+        return logits, (attn_gene, attn_methyl, attn_mirna)
 
 
 def train_and_eval(train_ds,
@@ -202,43 +135,22 @@ def train_and_eval(train_ds,
                    n_mirna,
                    n_classes,
                    res_dir,
+                   batch_size=136,
                    epochs=200,
                    lr=1e-2,
                    dropout=0.2,
-                   weight_decay=0.0,
-                   use_graph=True,
-                   g_hidden=128,
-                   g_out=64,
-                   align_lambda=0.1,
-                   knn_k=10):
+                   weight_decay=0.0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_gene = train_ds.gene_x.to(device)
-    train_methyl = train_ds.methyl_x.to(device)
-    train_mirna = train_ds.mirna_x.to(device)
-    train_y = train_ds.y.to(device)
-
-    test_gene = test_ds.gene_x.to(device)
-    test_methyl = test_ds.methyl_x.to(device)
-    test_mirna = test_ds.mirna_x.to(device)
-    test_y = test_ds.y.to(device)
-
-    adj_gene_tr = build_knn_adj(train_gene.cpu().numpy(), knn_k).to(device) if use_graph else None
-    adj_methyl_tr = build_knn_adj(train_methyl.cpu().numpy(), knn_k).to(device) if use_graph else None
-    adj_mirna_tr = build_knn_adj(train_mirna.cpu().numpy(), knn_k).to(device) if use_graph else None
-    adj_gene_te = build_knn_adj(test_gene.cpu().numpy(), knn_k).to(device) if use_graph else None
-    adj_methyl_te = build_knn_adj(test_methyl.cpu().numpy(), knn_k).to(device) if use_graph else None
-    adj_mirna_te = build_knn_adj(test_mirna.cpu().numpy(), knn_k).to(device) if use_graph else None
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_ds, batch_size=len(test_ds), shuffle=False)
 
     model = MoBRCANetTorch(
         n_gene=n_gene,
         n_methyl=n_methyl,
         n_mirna=n_mirna,
         n_classes=n_classes,
-        dropout=dropout,
-        use_graph=use_graph,
-        g_hidden=g_hidden,
-        g_out=g_out
+        dropout=dropout
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -256,44 +168,54 @@ def train_and_eval(train_ds,
     for epoch in range(1, epochs + 1):
         # --- train ---
         model.train()
-        optimizer.zero_grad()
-        logits, (_, _, _), reps = model(train_gene, train_methyl, train_mirna,
-                                        adj_gene_tr, adj_methyl_tr, adj_mirna_tr)
-        loss_ce = criterion(logits, train_y)
-        if use_graph:
-            rep_gene_f, rep_methyl_f, rep_mirna_f = reps
-            rep_gene_n = nn.functional.normalize(rep_gene_f, dim=1)
-            rep_methyl_n = nn.functional.normalize(rep_methyl_f, dim=1)
-            rep_mirna_n = nn.functional.normalize(rep_mirna_f, dim=1)
-            align_loss = (1 - (rep_gene_n * rep_methyl_n).sum(dim=1)).mean() + \
-                         (1 - (rep_gene_n * rep_mirna_n).sum(dim=1)).mean()
-            loss = loss_ce + align_lambda * align_loss
-        else:
-            loss = loss_ce
-        loss.backward()
-        optimizer.step()
+        running_loss = 0.0
+        running_correct = 0
+        running_total = 0
 
-        preds = logits.argmax(dim=1)
-        train_loss = loss.item()
-        train_acc = (preds == train_y).float().mean().item()
+        for gene_x, methyl_x, mirna_x, y in train_loader:
+            gene_x = gene_x.to(device)
+            methyl_x = methyl_x.to(device)
+            mirna_x = mirna_x.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad()
+            logits, _ = model(gene_x, methyl_x, mirna_x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * y.size(0)
+            preds = logits.argmax(dim=1)
+            running_correct += (preds == y).sum().item()
+            running_total += y.size(0)
+
+        train_loss = running_loss / running_total
+        train_acc = running_correct / running_total
 
         # --- eval trên test ---
         model.eval()
         with torch.no_grad():
-            logits_te, (attn_gene, attn_methyl, attn_mirna), _ = model(
-                test_gene, test_methyl, test_mirna,
-                adj_gene_te, adj_methyl_te, adj_mirna_te
-            )
-            preds_te = logits_te.argmax(dim=1)
-            test_acc = (preds_te == test_y).float().mean().item()
+            for gene_x, methyl_x, mirna_x, y in test_loader:
+                gene_x = gene_x.to(device)
+                methyl_x = methyl_x.to(device)
+                mirna_x = mirna_x.to(device)
+                y = y.to(device)
 
-            if test_acc > best_acc:
-                best_acc = test_acc
-                best_pred = preds_te.cpu().numpy()
-                best_label = test_y.cpu().numpy()
-                best_attn_gene = attn_gene.cpu().numpy()
-                best_attn_methyl = attn_methyl.cpu().numpy()
-                best_attn_mirna = attn_mirna.cpu().numpy()
+                logits, (attn_gene, attn_methyl, attn_mirna) = model(
+                    gene_x, methyl_x, mirna_x
+                )
+                preds = logits.argmax(dim=1)
+                correct = (preds == y).sum().item()
+                total = y.size(0)
+                test_acc = correct / total
+
+                if test_acc > best_acc:
+                    best_acc = test_acc
+                    best_pred = preds.cpu().numpy()
+                    best_label = y.cpu().numpy()
+                    best_attn_gene = attn_gene.cpu().numpy()
+                    best_attn_methyl = attn_methyl.cpu().numpy()
+                    best_attn_mirna = attn_mirna.cpu().numpy()
 
         print(
             f"Epoch {epoch:04d} | "
@@ -360,13 +282,9 @@ def main():
     test_ds = MultiOmicsDataset(x_gene_test, x_methyl_test, x_mirna_test, y_test)
 
     epochs = int(os.getenv("EPOCHS", "200"))
+    batch_size = int(os.getenv("BATCH_SIZE", "136"))
     lr = float(os.getenv("LR", "1e-2"))
     weight_decay = float(os.getenv("WEIGHT_DECAY", "1e-4"))
-    use_graph = os.getenv("USE_GRAPH", "1") != "0"
-    g_hidden = int(os.getenv("G_HIDDEN", "128"))
-    g_out = int(os.getenv("G_OUT", "64"))
-    align_lambda = float(os.getenv("ALIGN_LAMBDA", "0.1"))
-    knn_k = int(os.getenv("KNN_K", "10"))
 
     train_and_eval(
         train_ds=train_ds,
@@ -376,15 +294,11 @@ def main():
         n_mirna=n_mirna,
         n_classes=n_classes,
         res_dir=res_dir,
+        batch_size=batch_size,
         epochs=epochs,
         lr=lr,
         dropout=0.2,
-        weight_decay=weight_decay,
-        use_graph=use_graph,
-        g_hidden=g_hidden,
-        g_out=g_out,
-        align_lambda=align_lambda,
-        knn_k=knn_k
+        weight_decay=weight_decay
     )
 
 
